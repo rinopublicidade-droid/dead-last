@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
-  <title>Dead Last — Sem Host (Firebase Firestore)</title>
+  <title>Dead Last — Sem Host (Firestore)</title>
   <style>
     :root { --bg:#0b1020; --card:#121a33; --muted:#8ea0c6; --txt:#e8ecff; --ok:#37d67a; --bad:#ff4d6d; --warn:#ffcc00; }
     *{box-sizing:border-box}
@@ -121,13 +121,14 @@
             <h2 style="margin:0 0 10px;font-size:14px;color:#cfd8ff">Seu voto</h2>
             <label>Escolha o alvo</label>
             <select id="voteSelect" disabled></select>
+
+            <!-- NOVO: dica do porquê o voto está travado -->
+            <p class="small muted" id="voteHint" style="margin:10px 0 0"></p>
+
             <div class="row" style="margin-top:10px">
               <div style="flex:1 1 160px"><button id="btnVote" class="primary" disabled>Enviar voto</button></div>
               <div style="flex:1 1 160px"><button id="btnUnvote" disabled>Limpar voto</button></div>
             </div>
-            <p class="small muted" style="margin:10px 0 0">
-              O voto fica salvo no Firestore (UI não mostra). A rodada revela e resolve automaticamente no fim.
-            </p>
           </div>
         </div>
 
@@ -136,19 +137,6 @@
         <h2 style="margin:0 0 10px;font-size:14px;color:#cfd8ff">Log</h2>
         <div class="log" id="log"></div>
       </div>
-    </div>
-
-    <div class="card" style="margin-top:14px">
-      <h2>Checklist Firebase</h2>
-      <ol class="small muted" style="margin:0; padding-left:18px; line-height:1.5">
-        <li><b>Firestore Database</b> criado (Cloud Firestore)</li>
-        <li>Authentication → habilite <b>Anonymous</b></li>
-        <li>Firestore Rules: use um conjunto simples (exemplo no fim do arquivo)</li>
-        <li>Hospede no GitHub Pages (ou Firebase Hosting)</li>
-      </ol>
-      <p class="small muted" style="margin:10px 0 0">
-        Para “voto realmente secreto”, já envolve Cloud Functions/criptografia (porque no client puro alguém técnico pode bisbilhotar).
-      </p>
     </div>
   </div>
 
@@ -197,6 +185,7 @@
     const voteSelect = UI("voteSelect");
     const btnVote = UI("btnVote");
     const btnUnvote = UI("btnUnvote");
+    const voteHint = UI("voteHint");
 
     const params = new URLSearchParams(location.search);
     const preRoom = params.get("room");
@@ -241,7 +230,7 @@
       return (code || "").trim().toUpperCase().replace(/[^A-Z0-9]/g,"").slice(0,10);
     }
 
-    // Coleções (se quiser “resetar” dados de testes, basta apagar a collection deadlast_rooms2 no Firestore)
+    // Coleções
     function roomRef(code) { return doc(db, "deadlast_rooms2", code); }
     function playersCol(code) { return collection(db, "deadlast_rooms2", code, "players"); }
     function votesCol(code) { return collection(db, "deadlast_rooms2", code, "votes"); }
@@ -347,21 +336,41 @@
       computeUI();
     }
 
+    /******************************************************************
+     * CORREÇÃO: explica por que o select/voto está travado (voteHint)
+     ******************************************************************/
     function computeUI() {
-      const phase = room?.phase || "lobby"; // lobby | negotiation | voting | reveal
+      const phase = room?.phase || "lobby";
       phaseTitle.textContent = `Fase: ${phase}`;
       roundN.textContent = String(room?.round ?? 0);
 
-      const canReady = !!roomId && !!me?.alive && (phase==="lobby" || phase==="reveal");
+      const inRoom = !!roomId;
+      const alive = !!me?.alive;
+
+      const canReady = inRoom && alive && (phase === "lobby" || phase === "reveal");
       setEnabled(btnReady, canReady);
 
-      const canVote = !!roomId && !!me?.alive && phase==="voting";
+      // Importante: por padrão, voto só na VOTING.
+      // Se você quiser pré-voto na negociação, mude para: (phase==="voting" || phase==="negotiation")
+      const canVote = inRoom && alive && (phase === "voting");
+
       setEnabled(voteSelect, canVote);
       setEnabled(btnVote, canVote);
       setEnabled(btnUnvote, canVote);
 
-      setEnabled(btnLeave, !!roomId);
-      setEnabled(btnCopy, !!roomId);
+      setEnabled(btnLeave, inRoom);
+      setEnabled(btnCopy, inRoom);
+
+      // dica do voto (evita "clique morto")
+      let hint = "";
+      if (!inRoom) hint = "Entre em uma sala para votar.";
+      else if (!uid) hint = "Aguardando autenticação… (confira Anonymous no Firebase Auth).";
+      else if (!alive) hint = "Você está morto nesta rodada; não vota.";
+      else if (phase !== "voting") hint = "O voto abre na fase de VOTAÇÃO (após a negociação).";
+      else if (voteSelect.options.length <= 1) hint = "Sem alvos disponíveis (precisa de mais jogadores vivos na sala).";
+      else hint = "Escolha um alvo e envie seu voto.";
+
+      voteHint.textContent = hint;
     }
 
     async function upsertMe(code, name) {
@@ -441,6 +450,7 @@
       roomId=null; room=null; me=null;
       playersEl.innerHTML="";
       voteSelect.innerHTML="";
+      voteHint.textContent="";
       shareLink.value="";
       phaseTitle.textContent="Fase: —";
       roundN.textContent="—";
@@ -463,8 +473,6 @@
 
         computeUI();
         startLocalTimer();
-
-        // sempre que a sala mudar, tenta avançar
         advanceIfNeeded("room-snapshot").catch(()=>{});
       });
 
@@ -478,12 +486,13 @@
     }
 
     /******************************************************************
-     * VOTOS (com contagem via transaction)
+     * VOTOS
      ******************************************************************/
     async function sendVote() {
       if (!roomId || !room || !me?.alive) return;
+
       const phase = room.phase || "lobby";
-      if (phase !== "voting") { alert("Ainda não é fase de votação."); return; }
+      if (phase !== "voting") { alert("O voto abre na fase de VOTAÇÃO."); return; }
 
       const targetUid = voteSelect.value;
       if (!targetUid) { alert("Escolha um alvo."); return; }
@@ -495,10 +504,16 @@
         const [rSnap, vSnap] = await Promise.all([tx.get(rRef), tx.get(vRef)]);
         if (!rSnap.exists()) throw new Error("Sala não existe.");
         const r = rSnap.data();
-        if ((r.phase||"") !== "voting") throw new Error("Não está em votação.");
-        if (vSnap.exists()) return; // já votou; travamos pra evitar bagunça
 
-        tx.set(vRef, { voterUid: uid, targetUid, at: serverTimestamp(), round: r.round || 0 });
+        const curPhase = r.phase || "lobby";
+        if (curPhase !== "voting") throw new Error("Não está em votação.");
+
+        const curRound = r.round || 0;
+
+        // trava "1 voto por rodada" (se quiser permitir mudar voto, eu adapto)
+        if (vSnap.exists()) return;
+
+        tx.set(vRef, { voterUid: uid, targetUid, at: serverTimestamp(), round: curRound });
         tx.update(rRef, { voteCount: increment(1) });
       });
 
@@ -618,10 +633,8 @@
         b.update(doc(playersCol(code), w), { power: (p.power||0) + 1 });
       }
 
-      // limpa ready dos vivos
       for (const p of players) if (p.alive) b.update(doc(playersCol(code), p.uid), { ready:false });
 
-      // apaga votos e zera contagem
       const vSnap = await getDocs(votesCol(code));
       vSnap.docs.forEach(d => b.delete(d.ref));
 
@@ -652,7 +665,6 @@
         if (result.winners?.length) toast(`⬆️ +1 poder: ${result.winners.map(u=>names[u]||u.slice(0,6)).join(", ")}`, "ok");
       }
 
-      // vencedor
       const pSnap2 = await getDocs(playersCol(code));
       const aliveNow = pSnap2.docs.map(d=>d.data()).filter(p=>p.alive);
       if (aliveNow.length === 1) toast(`🏆 Fim! Vencedor: ${aliveNow[0].name}`, "ok");
@@ -698,7 +710,6 @@
         const readyCount = r.readyCount || 0;
         const voteCount = r.voteCount || 0;
 
-        // Lobby -> Negotiation: todos prontos e min players
         if (phase === "lobby") {
           if (aliveCount < MIN_PLAYERS) return;
           if (readyCount >= aliveCount && aliveCount >= MIN_PLAYERS) {
@@ -712,7 +723,6 @@
           return;
         }
 
-        // Negotiation -> Voting: timer acabou
         if (phase === "negotiation") {
           if (phaseEndsAt && now >= phaseEndsAt) {
             tx.update(rRef, {
@@ -724,11 +734,11 @@
           return;
         }
 
-        // Voting -> Reveal: todos votaram OU timer acabou
         if (phase === "voting") {
           const timeUp = phaseEndsAt && now >= phaseEndsAt;
           const allVoted = aliveCount > 0 && voteCount >= aliveCount;
           const lastResolved = r.lastResolvedRound || 0;
+
           if ((timeUp || allVoted) && lastResolved < round) {
             tx.update(rRef, {
               phase: "reveal",
@@ -738,8 +748,6 @@
           }
           return;
         }
-
-        // Reveal: resolução fora do tx
       });
 
       await applyResolutionIfNeeded(roomId);
@@ -786,39 +794,20 @@
       if (user) {
         uid = user.uid;
         setStatus("Autenticado (anônimo) — pronto");
-        setEnabled(btnCopy, !!roomId);
-      } else setStatus("Desconectado");
+      } else {
+        setStatus("Desconectado");
+      }
+      computeUI();
     });
-    ensureAuth().catch(()=>{});
 
-    toast("Crie/entre na sala. No Lobby, TODOS VIVOS marcam PRONTO para iniciar. Sem host 😈", "ok");
+    // autentica logo ao abrir
+    ensureAuth().catch((e)=> {
+      console.error(e);
+      toast("Falha no Auth. Verifique se Anonymous está habilitado no Firebase.", "bad");
+      computeUI();
+    });
 
-    /******************************************************************
-     * Regras Firestore (EXEMPLO SIMPLES)
-     *
-     * ATENÇÃO: como é uma app client-side, regras muito abertas permitem bagunça.
-     * Para jogar entre amigos costuma servir. Se quiser endurecer, eu monto
-     * regras melhores + modelo com Cloud Functions.
-     *
-     * rules_version = '2';
-     * service cloud.firestore {
-     *   match /databases/{database}/documents {
-     *     match /deadlast_rooms2/{roomId} {
-     *       allow read: if true;
-     *       allow create, update: if request.auth != null;
-     *
-     *       match /players/{uid} {
-     *         allow read: if true;
-     *         allow create, update, delete: if request.auth != null && request.auth.uid == uid;
-     *       }
-     *       match /votes/{uid} {
-     *         allow read: if true; // se quiser privacidade, deixe false (mas aí a resolução client não funciona)
-     *         allow create, update, delete: if request.auth != null && request.auth.uid == uid;
-     *       }
-     *     }
-     *   }
-     * }
-     ******************************************************************/
+    toast("Crie/entre na sala. No Lobby, TODOS VIVOS marcam PRONTO para iniciar.", "ok");
   </script>
 </body>
 </html>
