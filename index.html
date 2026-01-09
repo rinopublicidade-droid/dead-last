@@ -213,4 +213,612 @@
     // Ajustes de jogo (sem host)
     const NEGOTIATION_SEC = 180;     // 3 min
     const VOTING_SEC = 60;          // 1 min
-    const REVEAL_SEC =_
+    const REVEAL_SEC = 18;          // tempo curto pra ler (depois volta pro lobby)
+    const MIN_PLAYERS = 3;
+
+    function toast(msg, kind="") {
+      const stamp = new Date().toLocaleTimeString([], {hour:"2-digit", minute:"2-digit"});
+      const prefix = kind==="ok" ? "✅ " : kind==="bad" ? "⛔ " : kind==="warn" ? "⚠️ " : "• ";
+      logEl.textContent = `${prefix}[${stamp}] ${msg}\n` + logEl.textContent;
+    }
+    function setStatus(text){ statusPill.textContent = text; }
+    function setEnabled(el, v){ el.disabled = !v; }
+
+    function fmtMMSS(sec) {
+      sec = Math.max(0, Math.floor(sec));
+      const m = String(Math.floor(sec/60)).padStart(2,"0");
+      const s = String(sec%60).padStart(2,"0");
+      return `${m}:${s}`;
+    }
+
+    function makeRoomCode() {
+      const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+      let out = "";
+      for (let i=0;i<6;i++) out += chars[Math.floor(Math.random()*chars.length)];
+      return out;
+    }
+    function cleanCode(code) {
+      return (code || "").trim().toUpperCase().replace(/[^A-Z0-9]/g,"").slice(0,10);
+    }
+
+    // Coleções (se quiser “resetar” dados de testes, basta apagar a collection deadlast_rooms2 no Firestore)
+    function roomRef(code) { return doc(db, "deadlast_rooms2", code); }
+    function playersCol(code) { return collection(db, "deadlast_rooms2", code, "players"); }
+    function votesCol(code) { return collection(db, "deadlast_rooms2", code, "votes"); }
+
+    async function ensureAuth() {
+      if (uid) return uid;
+      await signInAnonymously(auth);
+      return new Promise((resolve) => {
+        const off = onAuthStateChanged(auth, (user) => {
+          if (user) { uid = user.uid; off(); resolve(uid); }
+        });
+      });
+    }
+
+    function stopLocalTimer(){ if (timerInt) clearInterval(timerInt); timerInt=null; }
+    function startLocalTimer(){
+      stopLocalTimer();
+      timerInt = setInterval(() => {
+        if (!room) { timerEl.textContent = "00:00"; return; }
+        const phaseEndsAt = room.phaseEndsAtMillis || 0;
+        const phase = room.phase || "lobby";
+        if (!phaseEndsAt || phase==="lobby") { timerEl.textContent = "00:00"; return; }
+        const left = (phaseEndsAt/1000) - (Date.now()/1000);
+        timerEl.textContent = fmtMMSS(left);
+      }, 250);
+    }
+
+    async function renderPlayers(code) {
+      const snap = await getDocs(playersCol(code));
+      const arr = snap.docs.map(d => ({ id:d.id, ...d.data() }))
+        .sort((a,b) => (b.power||0)-(a.power||0) || (a.name||"").localeCompare(b.name||""));
+
+      playersEl.innerHTML = "";
+      voteSelect.innerHTML = "";
+
+      const alive = arr.filter(p => p.alive);
+
+      const ph = document.createElement("option");
+      ph.value = "";
+      ph.textContent = "— escolha —";
+      voteSelect.appendChild(ph);
+
+      for (const p of alive) {
+        if (p.uid === uid) continue;
+        const opt = document.createElement("option");
+        opt.value = p.uid;
+        opt.textContent = `${p.name} (Poder ${p.power||0})`;
+        voteSelect.appendChild(opt);
+      }
+
+      for (const p of arr) {
+        const div = document.createElement("div");
+        div.className = "p";
+
+        const left = document.createElement("div");
+        left.className = "left";
+
+        const nm = document.createElement("div");
+        nm.className = "name";
+        nm.textContent = p.name || "Sem nome";
+
+        const tags = document.createElement("div");
+        tags.className = "tags";
+
+        const tPower = document.createElement("span");
+        tPower.className = "tag power";
+        tPower.textContent = `Poder ${p.power||0}`;
+        tags.appendChild(tPower);
+
+        if (p.ready) {
+          const t = document.createElement("span");
+          t.className = "tag ready";
+          t.textContent = "Pronto";
+          tags.appendChild(t);
+        }
+
+        if (!p.alive) {
+          const t = document.createElement("span");
+          t.className = "tag dead";
+          t.textContent = "Morto";
+          tags.appendChild(t);
+        }
+
+        if (p.uid === uid) {
+          const t = document.createElement("span");
+          t.className = "tag me";
+          t.textContent = "Você";
+          tags.appendChild(t);
+        }
+
+        left.appendChild(nm);
+        left.appendChild(tags);
+
+        const right = document.createElement("div");
+        right.className = "small muted";
+        right.textContent = p.alive ? "🟢 vivo" : "🔴 fora";
+
+        div.appendChild(left);
+        div.appendChild(right);
+        playersEl.appendChild(div);
+      }
+
+      computeUI();
+    }
+
+    function computeUI() {
+      const phase = room?.phase || "lobby"; // lobby | negotiation | voting | reveal
+      phaseTitle.textContent = `Fase: ${phase}`;
+      roundN.textContent = String(room?.round ?? 0);
+
+      const canReady = !!roomId && !!me?.alive && (phase==="lobby" || phase==="reveal");
+      setEnabled(btnReady, canReady);
+
+      const canVote = !!roomId && !!me?.alive && phase==="voting";
+      setEnabled(voteSelect, canVote);
+      setEnabled(btnVote, canVote);
+      setEnabled(btnUnvote, canVote);
+
+      setEnabled(btnLeave, !!roomId);
+      setEnabled(btnCopy, !!roomId);
+    }
+
+    async function upsertMe(code, name) {
+      const ref = doc(playersCol(code), uid);
+      const snap = await getDoc(ref);
+      if (!snap.exists()) {
+        await setDoc(ref, {
+          uid,
+          name,
+          alive: true,
+          power: 0,
+          ready: false,
+          joinedAt: serverTimestamp()
+        });
+        toast(`Você entrou como "${name}".`, "ok");
+      } else {
+        const data = snap.data();
+        if ((data.name||"") !== name && name) {
+          await updateDoc(ref, { name });
+          toast(`Nome atualizado: ${name}`, "ok");
+        }
+      }
+    }
+
+    async function setReady(value) {
+      if (!roomId || !uid) return;
+      await updateDoc(doc(playersCol(roomId), uid), { ready: !!value });
+      toast(value ? "Você marcou PRONTO." : "Você desmarcou pronto.", "ok");
+      await advanceIfNeeded("ready-change");
+    }
+
+    async function enterRoom(code, name, creating=false) {
+      code = cleanCode(code);
+      if (!code) { alert("Informe um código de sala."); return; }
+      if (!name) { alert("Informe seu nome."); return; }
+
+      await ensureAuth();
+      const ref = roomRef(code);
+      const snap = await getDoc(ref);
+
+      if (creating) {
+        if (snap.exists()) { alert("Sala já existe. Use outro código."); return; }
+        await setDoc(ref, {
+          code,
+          phase: "lobby",
+          round: 0,
+          phaseEndsAtMillis: 0,
+          voteCount: 0,
+          aliveCount: 0,
+          readyCount: 0,
+          lastResolvedRound: 0,
+          revealed: { round:0, eliminatedUid:"", eliminatedName:"", tally:{}, winners:[] },
+          createdAt: serverTimestamp()
+        });
+        toast(`Sala ${code} criada.`, "ok");
+      } else {
+        if (!snap.exists()) { alert("Sala não encontrada."); return; }
+      }
+
+      roomId = code;
+      await upsertMe(code, name);
+
+      watchRoom(code);
+      computeUI();
+    }
+
+    async function leaveRoom() {
+      if (!roomId || !uid) return;
+      const b = writeBatch(db);
+      b.delete(doc(playersCol(roomId), uid));
+      b.delete(doc(votesCol(roomId), uid));
+      await b.commit();
+
+      unsubRoom?.(); unsubRoom=null;
+      unsubPlayers?.(); unsubPlayers=null;
+
+      roomId=null; room=null; me=null;
+      playersEl.innerHTML="";
+      voteSelect.innerHTML="";
+      shareLink.value="";
+      phaseTitle.textContent="Fase: —";
+      roundN.textContent="—";
+      timerEl.textContent="00:00";
+      setStatus("Desconectado");
+      computeUI();
+      toast("Você saiu.", "warn");
+    }
+
+    function watchRoom(code) {
+      unsubRoom?.();
+      unsubRoom = onSnapshot(roomRef(code), (snap) => {
+        room = snap.exists() ? snap.data() : null;
+        if (!room) return;
+
+        setStatus(`Conectado — Sala ${code}`);
+        const url = new URL(location.href);
+        url.searchParams.set("room", code);
+        shareLink.value = url.toString();
+
+        computeUI();
+        startLocalTimer();
+
+        // sempre que a sala mudar, tenta avançar
+        advanceIfNeeded("room-snapshot").catch(()=>{});
+      });
+
+      unsubPlayers?.();
+      unsubPlayers = onSnapshot(playersCol(code), async (snap) => {
+        const mine = snap.docs.find(d => d.id === uid);
+        me = mine ? mine.data() : null;
+        await renderPlayers(code);
+        await advanceIfNeeded("players-snapshot");
+      });
+    }
+
+    /******************************************************************
+     * VOTOS (com contagem via transaction)
+     ******************************************************************/
+    async function sendVote() {
+      if (!roomId || !room || !me?.alive) return;
+      const phase = room.phase || "lobby";
+      if (phase !== "voting") { alert("Ainda não é fase de votação."); return; }
+
+      const targetUid = voteSelect.value;
+      if (!targetUid) { alert("Escolha um alvo."); return; }
+
+      const rRef = roomRef(roomId);
+      const vRef = doc(votesCol(roomId), uid);
+
+      await runTransaction(db, async (tx) => {
+        const [rSnap, vSnap] = await Promise.all([tx.get(rRef), tx.get(vRef)]);
+        if (!rSnap.exists()) throw new Error("Sala não existe.");
+        const r = rSnap.data();
+        if ((r.phase||"") !== "voting") throw new Error("Não está em votação.");
+        if (vSnap.exists()) return; // já votou; travamos pra evitar bagunça
+
+        tx.set(vRef, { voterUid: uid, targetUid, at: serverTimestamp(), round: r.round || 0 });
+        tx.update(rRef, { voteCount: increment(1) });
+      });
+
+      toast("Voto enviado.", "ok");
+      await advanceIfNeeded("vote-sent");
+    }
+
+    async function clearMyVote() {
+      if (!roomId || !room) return;
+      const phase = room.phase || "lobby";
+      if (phase !== "voting") { alert("Só dá pra limpar durante a votação."); return; }
+
+      const rRef = roomRef(roomId);
+      const vRef = doc(votesCol(roomId), uid);
+
+      await runTransaction(db, async (tx) => {
+        const [rSnap, vSnap] = await Promise.all([tx.get(rRef), tx.get(vRef)]);
+        if (!rSnap.exists()) throw new Error("Sala não existe.");
+        const r = rSnap.data();
+        if ((r.phase||"") !== "voting") throw new Error("Não está em votação.");
+        if (!vSnap.exists()) return;
+
+        tx.delete(vRef);
+        tx.update(rRef, { voteCount: increment(-1) });
+      });
+
+      toast("Voto removido.", "warn");
+      await advanceIfNeeded("vote-cleared");
+    }
+
+    /******************************************************************
+     * AVANÇO AUTOMÁTICO (SEM HOST)
+     ******************************************************************/
+    async function syncCounts(code) {
+      if (!code) return;
+      const [pSnap, rSnap] = await Promise.all([getDocs(playersCol(code)), getDoc(roomRef(code))]);
+      if (!rSnap.exists()) return;
+      const r = rSnap.data();
+
+      const players = pSnap.docs.map(d=>d.data());
+      const alive = players.filter(p=>p.alive);
+      const aliveCount = alive.length;
+      const readyCount = alive.filter(p=>p.ready).length;
+
+      const needAlive = (r.aliveCount||0) !== aliveCount;
+      const needReady = (r.readyCount||0) !== readyCount;
+      if (needAlive || needReady) await updateDoc(roomRef(code), { aliveCount, readyCount });
+    }
+
+    function pickTieRandom(tiedUids, seedStr) {
+      let h = 2166136261;
+      for (let i=0;i<seedStr.length;i++) {
+        h ^= seedStr.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+      }
+      const idx = Math.abs(h) % tiedUids.length;
+      return tiedUids[idx];
+    }
+
+    async function resolveVotingRound(code, roundNumber) {
+      const [vSnap, pSnap] = await Promise.all([getDocs(votesCol(code)), getDocs(playersCol(code))]);
+      const players = pSnap.docs.map(d => d.data());
+      const alive = players.filter(p => p.alive);
+      const names = Object.fromEntries(players.map(p => [p.uid, p.name || p.uid.slice(0,6)]));
+
+      const tally = {};
+      const votes = [];
+      for (const d of vSnap.docs) {
+        const v = d.data();
+        if ((v.round ?? -1) !== roundNumber) continue;
+        const voterAlive = alive.some(p => p.uid === v.voterUid);
+        const targetAlive = alive.some(p => p.uid === v.targetUid);
+        if (!voterAlive || !targetAlive) continue;
+        tally[v.targetUid] = (tally[v.targetUid] || 0) + 1;
+        votes.push(v);
+      }
+
+      const entries = Object.entries(tally).sort((a,b)=>b[1]-a[1]);
+      if (!entries.length) return { eliminatedUid:"", eliminatedName:"", tally:{}, winners:[] };
+
+      const max = entries[0][1];
+      const tied = entries.filter(([,c])=>c===max).map(([u])=>u);
+
+      let eliminatedUid = tied[0];
+      if (tied.length > 1) eliminatedUid = pickTieRandom(tied, `${code}|r${roundNumber}|${tied.join(",")}`);
+
+      const eliminatedName = names[eliminatedUid] || "?";
+      const winners = votes.filter(v => v.targetUid === eliminatedUid).map(v => v.voterUid);
+
+      return { eliminatedUid, eliminatedName, tally, winners };
+    }
+
+    async function applyResolutionIfNeeded(code) {
+      const rSnap = await getDoc(roomRef(code));
+      if (!rSnap.exists()) return;
+      const r = rSnap.data();
+      if ((r.phase||"") !== "reveal") return;
+
+      const round = r.round || 0;
+      if ((r.revealed?.round ?? 0) === round) return;
+
+      const result = await resolveVotingRound(code, round);
+
+      const [pSnap] = await Promise.all([getDocs(playersCol(code))]);
+      const players = pSnap.docs.map(d=>d.data());
+      const names = Object.fromEntries(players.map(p => [p.uid, p.name || p.uid.slice(0,6)]));
+
+      const b = writeBatch(db);
+
+      if (result.eliminatedUid) {
+        b.update(doc(playersCol(code), result.eliminatedUid), { alive:false, ready:false });
+      }
+
+      for (const w of result.winners) {
+        const p = players.find(x => x.uid === w);
+        if (!p || !p.alive) continue;
+        b.update(doc(playersCol(code), w), { power: (p.power||0) + 1 });
+      }
+
+      // limpa ready dos vivos
+      for (const p of players) if (p.alive) b.update(doc(playersCol(code), p.uid), { ready:false });
+
+      // apaga votos e zera contagem
+      const vSnap = await getDocs(votesCol(code));
+      vSnap.docs.forEach(d => b.delete(d.ref));
+
+      const tallyNamed = {};
+      for (const [uidKey, count] of Object.entries(result.tally || {})) {
+        tallyNamed[names[uidKey] || uidKey.slice(0,6)] = count;
+      }
+
+      b.update(roomRef(code), {
+        voteCount: 0,
+        revealed: {
+          round,
+          eliminatedUid: result.eliminatedUid,
+          eliminatedName: result.eliminatedName,
+          tally: tallyNamed,
+          winners: result.winners.map(u=>names[u] || u.slice(0,6))
+        }
+      });
+
+      await b.commit();
+
+      if (!Object.keys(tallyNamed).length) {
+        toast(`Rodada ${round}: ninguém votou válido. Ninguém foi eliminado.`, "warn");
+      } else {
+        toast(`📊 Rodada ${round} — Apuração:`, "ok");
+        for (const [n,c] of Object.entries(tallyNamed)) toast(`  ${n}: ${c}`);
+        if (result.eliminatedName) toast(`💀 Eliminado: ${result.eliminatedName}`, "bad");
+        if (result.winners?.length) toast(`⬆️ +1 poder: ${result.winners.map(u=>names[u]||u.slice(0,6)).join(", ")}`, "ok");
+      }
+
+      // vencedor
+      const pSnap2 = await getDocs(playersCol(code));
+      const aliveNow = pSnap2.docs.map(d=>d.data()).filter(p=>p.alive);
+      if (aliveNow.length === 1) toast(`🏆 Fim! Vencedor: ${aliveNow[0].name}`, "ok");
+    }
+
+    async function moveRevealToLobbyIfReady(code) {
+      const rSnap = await getDoc(roomRef(code));
+      if (!rSnap.exists()) return;
+      const r = rSnap.data();
+      if ((r.phase||"") !== "reveal") return;
+
+      const now = Date.now();
+      const timeUp = (r.phaseEndsAtMillis||0) && now >= r.phaseEndsAtMillis;
+      const aliveCount = r.aliveCount || 0;
+      const readyCount = r.readyCount || 0;
+
+      if (aliveCount <= 1) return;
+
+      if (timeUp || (aliveCount > 0 && readyCount >= aliveCount)) {
+        await updateDoc(roomRef(code), { phase: "lobby", phaseEndsAtMillis: 0 });
+        toast("Voltando ao Lobby. Marquem PRONTO para iniciar a próxima rodada.", "ok");
+      }
+    }
+
+    async function advanceIfNeeded(reason="") {
+      if (!roomId) return;
+
+      await syncCounts(roomId);
+
+      const rRef = roomRef(roomId);
+
+      await runTransaction(db, async (tx) => {
+        const rSnap = await tx.get(rRef);
+        if (!rSnap.exists()) return;
+        const r = rSnap.data();
+
+        const phase = r.phase || "lobby";
+        const now = Date.now();
+        const round = r.round || 0;
+        const phaseEndsAt = r.phaseEndsAtMillis || 0;
+
+        const aliveCount = r.aliveCount || 0;
+        const readyCount = r.readyCount || 0;
+        const voteCount = r.voteCount || 0;
+
+        // Lobby -> Negotiation: todos prontos e min players
+        if (phase === "lobby") {
+          if (aliveCount < MIN_PLAYERS) return;
+          if (readyCount >= aliveCount && aliveCount >= MIN_PLAYERS) {
+            tx.update(rRef, {
+              phase: "negotiation",
+              round: round + 1,
+              phaseEndsAtMillis: now + (NEGOTIATION_SEC * 1000),
+              voteCount: 0
+            });
+          }
+          return;
+        }
+
+        // Negotiation -> Voting: timer acabou
+        if (phase === "negotiation") {
+          if (phaseEndsAt && now >= phaseEndsAt) {
+            tx.update(rRef, {
+              phase: "voting",
+              phaseEndsAtMillis: now + (VOTING_SEC * 1000),
+              voteCount: 0
+            });
+          }
+          return;
+        }
+
+        // Voting -> Reveal: todos votaram OU timer acabou
+        if (phase === "voting") {
+          const timeUp = phaseEndsAt && now >= phaseEndsAt;
+          const allVoted = aliveCount > 0 && voteCount >= aliveCount;
+          const lastResolved = r.lastResolvedRound || 0;
+          if ((timeUp || allVoted) && lastResolved < round) {
+            tx.update(rRef, {
+              phase: "reveal",
+              phaseEndsAtMillis: now + (REVEAL_SEC * 1000),
+              lastResolvedRound: round
+            });
+          }
+          return;
+        }
+
+        // Reveal: resolução fora do tx
+      });
+
+      await applyResolutionIfNeeded(roomId);
+      await syncCounts(roomId);
+      await moveRevealToLobbyIfReady(roomId);
+    }
+
+    /******************************************************************
+     * BINDINGS
+     ******************************************************************/
+    btnCreate.addEventListener("click", async () => {
+      try {
+        const name = elName.value.trim();
+        let code = cleanCode(elRoom.value);
+        if (!code) { code = makeRoomCode(); elRoom.value = code; }
+        await enterRoom(code, name, true);
+      } catch (e) { console.error(e); alert(String(e.message||e)); }
+    });
+
+    btnJoin.addEventListener("click", async () => {
+      try {
+        const name = elName.value.trim();
+        const code = cleanCode(elRoom.value);
+        await enterRoom(code, name, false);
+      } catch (e) { console.error(e); alert(String(e.message||e)); }
+    });
+
+    btnLeave.addEventListener("click", () => leaveRoom());
+    btnCopy.addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(shareLink.value); toast("Link copiado!", "ok"); }
+      catch { alert("Copie manualmente."); }
+    });
+
+    btnReady.addEventListener("click", async () => {
+      if (!me?.alive) return;
+      const next = !me?.ready;
+      await setReady(next);
+    });
+
+    btnVote.addEventListener("click", () => sendVote().catch(e=>alert(e.message)));
+    btnUnvote.addEventListener("click", () => clearMyVote().catch(e=>alert(e.message)));
+
+    onAuthStateChanged(auth, (user) => {
+      if (user) {
+        uid = user.uid;
+        setStatus("Autenticado (anônimo) — pronto");
+        setEnabled(btnCopy, !!roomId);
+      } else setStatus("Desconectado");
+    });
+    ensureAuth().catch(()=>{});
+
+    toast("Crie/entre na sala. No Lobby, TODOS VIVOS marcam PRONTO para iniciar. Sem host 😈", "ok");
+
+    /******************************************************************
+     * Regras Firestore (EXEMPLO SIMPLES)
+     *
+     * ATENÇÃO: como é uma app client-side, regras muito abertas permitem bagunça.
+     * Para jogar entre amigos costuma servir. Se quiser endurecer, eu monto
+     * regras melhores + modelo com Cloud Functions.
+     *
+     * rules_version = '2';
+     * service cloud.firestore {
+     *   match /databases/{database}/documents {
+     *     match /deadlast_rooms2/{roomId} {
+     *       allow read: if true;
+     *       allow create, update: if request.auth != null;
+     *
+     *       match /players/{uid} {
+     *         allow read: if true;
+     *         allow create, update, delete: if request.auth != null && request.auth.uid == uid;
+     *       }
+     *       match /votes/{uid} {
+     *         allow read: if true; // se quiser privacidade, deixe false (mas aí a resolução client não funciona)
+     *         allow create, update, delete: if request.auth != null && request.auth.uid == uid;
+     *       }
+     *     }
+     *   }
+     * }
+     ******************************************************************/
+  </script>
+</body>
+</html>
